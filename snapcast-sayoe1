@@ -1,0 +1,323 @@
+#!/usr/bin/env python3
+
+import configparser
+import glob
+import json
+import socket
+import sys
+import time
+
+from evdev import InputDevice, ecodes
+
+
+CONFIG_FILE = "/etc/snapcast-e1.conf"
+
+config = configparser.ConfigParser()
+config.read(CONFIG_FILE)
+
+SERVER = config.get("Snapcast", "SERVER", fallback="snap.local")
+PORT = config.getint("Snapcast", "PORT", fallback=1705)
+CLIENT_ID = config.get("Snapcast", "CLIENT_ID", fallback="")
+VOLUME_STEP = config.getint("Snapcast", "VOLUME_STEP", fallback=5)
+
+_rpc_id = 0
+
+
+def rpc(method, params=None):
+    global _rpc_id
+
+    _rpc_id += 1
+    request_id = _rpc_id
+
+    request = {
+        "id": request_id,
+        "jsonrpc": "2.0",
+        "method": method,
+    }
+
+    if params is not None:
+        request["params"] = params
+
+    with socket.create_connection((SERVER, PORT), timeout=5) as sock:
+        sock.sendall((json.dumps(request) + "\r\n").encode())
+
+        buffer = b""
+
+        while True:
+            data = sock.recv(65535)
+
+            if not data:
+                raise RuntimeError("Snapcast connection closed.")
+
+            buffer += data
+
+            while b"\r\n" in buffer:
+                line, buffer = buffer.split(b"\r\n", 1)
+
+                if not line:
+                    continue
+
+                response = json.loads(line.decode())
+
+                if response.get("id") != request_id:
+                    continue
+
+                if "error" in response:
+                    raise RuntimeError(
+                        f"JSON-RPC error {method}: {response['error']}"
+                    )
+
+                return response.get("result")
+
+
+def get_status():
+    return rpc("Server.GetStatus")
+
+
+def get_all_clients(status):
+    clients = []
+
+    for group in status["server"]["groups"]:
+        for client in group["clients"]:
+            clients.append(
+                {
+                    "id": client["id"],
+                    "name": client.get("host", {}).get(
+                        "name",
+                        client["id"],
+                    ),
+                    "connected": client.get("connected", False),
+                    "group_id": group["id"],
+                    "stream_id": group.get("stream_id"),
+                }
+            )
+
+    return clients
+
+
+def print_all_clients(status):
+    print("Snapcast clients:")
+
+    for client in get_all_clients(status):
+        print(
+            f"  {client['name']}"
+            f" | {client['id']}"
+            f" | connected={client['connected']}"
+            f" | group={client['group_id']}"
+            f" | stream={client['stream_id']}"
+        )
+
+
+def find_group_for_client(status, client_id):
+    for group in status["server"]["groups"]:
+        for client in group["clients"]:
+            if client["id"] == client_id:
+                return group["id"]
+
+    return None
+
+
+def get_current_volume(status, client_id):
+    for group in status["server"]["groups"]:
+        for client in group["clients"]:
+            if client["id"] == client_id:
+                return client["config"]["volume"]["percent"]
+
+    raise RuntimeError(f"Snapcast client not found: {client_id}")
+
+
+def get_current_stream(status, group_id):
+    for group in status["server"]["groups"]:
+        if group["id"] == group_id:
+            return group.get("stream_id")
+
+    raise RuntimeError(f"Snapcast group not found: {group_id}")
+
+
+def get_streams(status):
+    """Return ALL Snapcast streams, including idle streams."""
+    return [stream["id"] for stream in status["server"]["streams"]]
+
+
+def set_volume(client_id, percent):
+    percent = max(0, min(100, int(percent)))
+
+    rpc(
+        "Client.SetVolume",
+        {
+            "id": client_id,
+            "volume": {
+                "muted": False,
+                "percent": percent,
+            },
+        },
+    )
+
+
+def set_stream(group_id, stream_id):
+    rpc(
+        "Group.SetStream",
+        {
+            "id": group_id,
+            "stream_id": stream_id,
+        },
+    )
+
+
+def find_e1():
+    """
+    Automatically find the SayoDevice E1 Consumer Control interface.
+    """
+
+    candidates = []
+
+    for event_path in glob.glob("/dev/input/event*"):
+        try:
+            device = InputDevice(event_path)
+            name = device.name.lower()
+
+            if (
+                "sayodevice" in name
+                and "e1" in name
+                and "consumer control" in name
+            ):
+                candidates.append(event_path)
+
+            device.close()
+
+        except Exception:
+            pass
+
+    if not candidates:
+        raise RuntimeError(
+            "No SayoDevice E1 Consumer Control interface detected."
+        )
+
+    if len(candidates) > 1:
+        print("WARNING: multiple E1 devices detected:")
+
+        for candidate in candidates:
+            print(f"  {candidate}")
+
+        raise RuntimeError(
+            "Cannot automatically choose between multiple E1 devices."
+        )
+
+    return candidates[0]
+
+
+def main():
+    if not CLIENT_ID:
+        raise RuntimeError(f"CLIENT_ID missing from {CONFIG_FILE}")
+
+    print("========================================")
+    print(" SayoDevice E1 -> Snapcast")
+    print("========================================")
+    print()
+    print(f"Snapcast server  : {SERVER}:{PORT}")
+    print(f"Configured client: {CLIENT_ID}")
+    print()
+
+    status = get_status()
+
+    print_all_clients(status)
+    print()
+
+    group_id = find_group_for_client(status, CLIENT_ID)
+
+    if group_id is None:
+        raise RuntimeError(
+            f"Could not find the group for client {CLIENT_ID}"
+        )
+
+    volume = get_current_volume(status, CLIENT_ID)
+    current_stream = get_current_stream(status, group_id)
+    streams = get_streams(status)
+
+    print(f"Associated group : {group_id}")
+    print(f"Initial volume   : {volume}%")
+    print(f"Initial stream   : {current_stream}")
+    print()
+
+    print("Available streams:")
+
+    for index, stream_id in enumerate(streams, start=1):
+        marker = "  <-- current" if stream_id == current_stream else ""
+        print(f"  {index}. {stream_id}{marker}")
+
+    print()
+
+    e1_path = find_e1()
+    device = InputDevice(e1_path)
+
+    print(f"E1 detected      : {e1_path}")
+    print(f"Device           : {device.name}")
+
+    device.grab()
+
+    print()
+    print("Controller ready.")
+    print("  Rotate right : volume +")
+    print("  Rotate left  : volume -")
+    print("  Click        : next stream")
+    print()
+
+    stream_index = 0
+
+    if current_stream in streams:
+        stream_index = streams.index(current_stream)
+
+    try:
+        for event in device.read_loop():
+            if event.type != ecodes.EV_KEY:
+                continue
+
+            keycode = event.keycode
+
+            if isinstance(keycode, list):
+                keys = keycode
+            else:
+                keys = [keycode]
+
+            if "KEY_VOLUMEUP" in keys and event.value == 1:
+                volume = min(100, volume + VOLUME_STEP)
+                set_volume(CLIENT_ID, volume)
+                print(f"Volume + : {volume}%")
+
+            elif "KEY_VOLUMEDOWN" in keys and event.value == 1:
+                volume = max(0, volume - VOLUME_STEP)
+                set_volume(CLIENT_ID, volume)
+                print(f"Volume - : {volume}%")
+
+            elif "KEY_MUTE" in keys and event.value == 1:
+                if not streams:
+                    continue
+
+                stream_index = (stream_index + 1) % len(streams)
+                new_stream = streams[stream_index]
+
+                set_stream(group_id, new_stream)
+                print(f"Next stream : {new_stream}")
+
+    finally:
+        try:
+            device.ungrab()
+        except Exception:
+            pass
+
+        try:
+            device.close()
+        except Exception:
+            pass
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        print()
+        print("Stopped.")
+    except Exception as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        time.sleep(1)
+        sys.exit(1)
